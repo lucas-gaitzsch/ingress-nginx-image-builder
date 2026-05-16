@@ -1,0 +1,228 @@
+name: Build ingress-nginx controller image
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Optional: konkreter Upstream-Tag, z. B. controller-v1.15.5. Leer lassen für neuesten controller-v* Release."
+        required: false
+        type: string
+
+  schedule:
+    # Täglich nachts. Zeit ist UTC.
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ingress-nginx-controller-image
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: chainguard-forks/ingress-nginx
+
+jobs:
+  build-and-push:
+    name: Build and push controller images to GHCR
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Resolve upstream release tag
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            UPSTREAM_TAG="${INPUT_TAG}"
+          else
+            UPSTREAM_TAG="$(
+              gh api "repos/${UPSTREAM_REPO}/releases?per_page=100" \
+                --jq '.[] | select(.tag_name | test("^controller-v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .tag_name' \
+              | head -n 1
+            )"
+          fi
+
+          if [[ -z "${UPSTREAM_TAG:-}" ]]; then
+            echo "No controller-v* release tag found." >&2
+            exit 1
+          fi
+
+          if [[ ! "${UPSTREAM_TAG}" =~ ^controller-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected upstream tag: ${UPSTREAM_TAG}" >&2
+            exit 1
+          fi
+
+          IMAGE_TAG="${UPSTREAM_TAG#controller-}"
+
+          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+
+          # Resulting images:
+          # ghcr.io/<org>/ingress-nginx/controller:<tag>
+          # ghcr.io/<org>/ingress-nginx/controller-chroot:<tag>
+          REGISTRY_BASE="ghcr.io/${OWNER_LC}/ingress-nginx"
+
+          echo "upstream_tag=${UPSTREAM_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "image_tag=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "registry_base=${REGISTRY_BASE}" >> "${GITHUB_OUTPUT}"
+
+          echo "Resolved upstream tag: ${UPSTREAM_TAG}"
+          echo "Image tag:             ${IMAGE_TAG}"
+          echo "Registry base:         ${REGISTRY_BASE}"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether version images already exist
+        id: exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REGISTRY_BASE="${{ steps.version.outputs.registry_base }}"
+          IMAGE_TAG="${{ steps.version.outputs.image_tag }}"
+
+          CONTROLLER_IMAGE="${REGISTRY_BASE}/controller:${IMAGE_TAG}"
+          CHROOT_IMAGE="${REGISTRY_BASE}/controller-chroot:${IMAGE_TAG}"
+
+          if docker buildx imagetools inspect "${CONTROLLER_IMAGE}" >/dev/null 2>&1 \
+             && docker buildx imagetools inspect "${CHROOT_IMAGE}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "Version images already exist:"
+            echo "  ${CONTROLLER_IMAGE}"
+            echo "  ${CHROOT_IMAGE}"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+            echo "At least one version image does not exist yet."
+            echo "Will build and push:"
+            echo "  ${CONTROLLER_IMAGE}"
+            echo "  ${CHROOT_IMAGE}"
+          fi
+
+      - name: Stop because images already exist
+        if: steps.exists.outputs.exists == 'true'
+        shell: bash
+        run: |
+          echo "No new upstream release to publish."
+          echo "Skipping checkout, build, push and latest tag update."
+
+      - name: Checkout upstream source
+        if: steps.exists.outputs.exists == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: chainguard-forks/ingress-nginx
+          ref: ${{ steps.version.outputs.upstream_tag }}
+          persist-credentials: false
+
+      - name: Set up QEMU for multi-arch builds
+        if: steps.exists.outputs.exists == 'false'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build and push controller images
+        if: steps.exists.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REGISTRY_BASE="${{ steps.version.outputs.registry_base }}"
+          IMAGE_TAG="${{ steps.version.outputs.image_tag }}"
+
+          export MAC_DOCKER_FLAGS="\
+            --label org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY} \
+            --label org.opencontainers.image.description=Self-built ingress-nginx controller image from chainguard-forks/ingress-nginx \
+            --label org.opencontainers.image.version=${IMAGE_TAG}"
+
+          make release \
+            REGISTRY="${REGISTRY_BASE}" \
+            TAG="${IMAGE_TAG}" \
+            PLATFORMS="amd64 arm64" \
+            BUILDX_PLATFORMS="linux/amd64,linux/arm64"
+
+      - name: Create additional tags
+        if: steps.exists.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REGISTRY_BASE="${{ steps.version.outputs.registry_base }}"
+          IMAGE_TAG="${{ steps.version.outputs.image_tag }}"
+          UPSTREAM_TAG="${{ steps.version.outputs.upstream_tag }}"
+
+          docker buildx imagetools create \
+            -t "${REGISTRY_BASE}/controller:latest" \
+            -t "${REGISTRY_BASE}/controller:${UPSTREAM_TAG}" \
+            "${REGISTRY_BASE}/controller:${IMAGE_TAG}"
+
+          docker buildx imagetools create \
+            -t "${REGISTRY_BASE}/controller-chroot:latest" \
+            -t "${REGISTRY_BASE}/controller-chroot:${UPSTREAM_TAG}" \
+            "${REGISTRY_BASE}/controller-chroot:${IMAGE_TAG}"
+
+      - name: Verify pushed images
+        if: steps.exists.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REGISTRY_BASE="${{ steps.version.outputs.registry_base }}"
+          IMAGE_TAG="${{ steps.version.outputs.image_tag }}"
+          UPSTREAM_TAG="${{ steps.version.outputs.upstream_tag }}"
+
+          docker buildx imagetools inspect "${REGISTRY_BASE}/controller:${IMAGE_TAG}"
+          docker buildx imagetools inspect "${REGISTRY_BASE}/controller:${UPSTREAM_TAG}"
+          docker buildx imagetools inspect "${REGISTRY_BASE}/controller:latest"
+
+          docker buildx imagetools inspect "${REGISTRY_BASE}/controller-chroot:${IMAGE_TAG}"
+          docker buildx imagetools inspect "${REGISTRY_BASE}/controller-chroot:${UPSTREAM_TAG}"
+          docker buildx imagetools inspect "${REGISTRY_BASE}/controller-chroot:latest"
+
+      - name: Write job summary for new publish
+        if: steps.exists.outputs.exists == 'false'
+        shell: bash
+        run: |
+          REGISTRY_BASE="${{ steps.version.outputs.registry_base }}"
+          IMAGE_TAG="${{ steps.version.outputs.image_tag }}"
+          UPSTREAM_TAG="${{ steps.version.outputs.upstream_tag }}"
+
+          {
+            echo "## Published ingress-nginx images"
+            echo ""
+            echo "| Image | Tag |"
+            echo "|---|---|"
+            echo "| \`${REGISTRY_BASE}/controller\` | \`${IMAGE_TAG}\` |"
+            echo "| \`${REGISTRY_BASE}/controller\` | \`${UPSTREAM_TAG}\` |"
+            echo "| \`${REGISTRY_BASE}/controller\` | \`latest\` |"
+            echo "| \`${REGISTRY_BASE}/controller-chroot\` | \`${IMAGE_TAG}\` |"
+            echo "| \`${REGISTRY_BASE}/controller-chroot\` | \`${UPSTREAM_TAG}\` |"
+            echo "| \`${REGISTRY_BASE}/controller-chroot\` | \`latest\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Write job summary for skipped publish
+        if: steps.exists.outputs.exists == 'true'
+        shell: bash
+        run: |
+          REGISTRY_BASE="${{ steps.version.outputs.registry_base }}"
+          IMAGE_TAG="${{ steps.version.outputs.image_tag }}"
+          UPSTREAM_TAG="${{ steps.version.outputs.upstream_tag }}"
+
+          {
+            echo "## No publish needed"
+            echo ""
+            echo "The latest upstream release is already present in GHCR."
+            echo ""
+            echo "| Image | Tag |"
+            echo "|---|---|"
+            echo "| \`${REGISTRY_BASE}/controller\` | \`${IMAGE_TAG}\` |"
+            echo "| \`${REGISTRY_BASE}/controller-chroot\` | \`${IMAGE_TAG}\` |"
+            echo ""
+            echo "Resolved upstream tag: \`${UPSTREAM_TAG}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
