@@ -136,11 +136,6 @@ jobs:
           REGISTRY_BASE="${{ steps.version.outputs.registry_base }}"
           IMAGE_TAG="${{ steps.version.outputs.image_tag }}"
 
-          export MAC_DOCKER_FLAGS="\
-            --label org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY} \
-            --label org.opencontainers.image.description=Self-built ingress-nginx controller image from chainguard-forks/ingress-nginx \
-            --label org.opencontainers.image.version=${IMAGE_TAG}"
-
           make release \
             REGISTRY="${REGISTRY_BASE}" \
             TAG="${IMAGE_TAG}" \
