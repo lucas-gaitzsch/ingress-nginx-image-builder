@@ -154,12 +154,10 @@ jobs:
 
           docker buildx imagetools create \
             -t "${REGISTRY_BASE}/controller:latest" \
-            -t "${REGISTRY_BASE}/controller:${UPSTREAM_TAG}" \
             "${REGISTRY_BASE}/controller:${IMAGE_TAG}"
 
           docker buildx imagetools create \
             -t "${REGISTRY_BASE}/controller-chroot:latest" \
-            -t "${REGISTRY_BASE}/controller-chroot:${UPSTREAM_TAG}" \
             "${REGISTRY_BASE}/controller-chroot:${IMAGE_TAG}"
 
       - name: Verify pushed images
