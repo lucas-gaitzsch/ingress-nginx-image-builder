@@ -43,8 +43,7 @@ jobs:
           else
             UPSTREAM_TAG="$(
               gh api "repos/${UPSTREAM_REPO}/releases?per_page=100" \
-                --jq '.[] | select(.tag_name | test("^controller-v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .tag_name' \
-              | head -n 1
+                --jq '[.[] | select(.tag_name | test("^controller-v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .tag_name][0] // empty'
             )"
           fi
 
@@ -60,7 +59,7 @@ jobs:
 
           IMAGE_TAG="${UPSTREAM_TAG#controller-}"
 
-          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"	
 
           # Resulting images:
           # ghcr.io/<org>/ingress-nginx/controller:<tag>
