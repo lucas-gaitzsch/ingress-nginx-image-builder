@@ -165,6 +165,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          sleep 10s
+
           REGISTRY_BASE="${{ steps.version.outputs.registry_base }}"
           IMAGE_TAG="${{ steps.version.outputs.image_tag }}"
           UPSTREAM_TAG="${{ steps.version.outputs.upstream_tag }}"
